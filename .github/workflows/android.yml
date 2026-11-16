@@ -14,25 +14,25 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Baixar repositório
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configurar Java 17
+      - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Configurar Android SDK
+      - name: Setup Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Instalar componentes Android
+      - name: Install Android SDK components
         run: |
           sdkmanager "platform-tools" \
             "platforms;android-35" \
             "build-tools;35.0.0"
 
-      - name: Encontrar e extrair projeto
+      - name: Locate and extract project
         run: |
           mkdir -p extracted
 
@@ -45,11 +45,10 @@ jobs:
             ZIP_FILE=$(find . -maxdepth 3 -type f -iname "*.zip" | head -n 1)
 
             if [ -z "$ZIP_FILE" ]; then
-              echo "ERRO: Não encontrei o projeto nem um arquivo ZIP."
+              echo "ERRO: Nenhum projeto Gradle ou ZIP encontrado."
               exit 1
             fi
 
-            echo "Extraindo: $ZIP_FILE"
             unzip -q "$ZIP_FILE" -d extracted
 
             PROJECT_DIR=$(find extracted -type f \
@@ -58,55 +57,81 @@ jobs:
           fi
 
           if [ -z "$PROJECT_DIR" ]; then
-            echo "ERRO: Não encontrei settings.gradle no projeto."
-            find . -maxdepth 4 -type f
+            echo "ERRO: settings.gradle não encontrado."
             exit 1
           fi
 
           PROJECT_DIR=$(realpath "$PROJECT_DIR")
 
-          if [ ! -f "$PROJECT_DIR/app/build.gradle" ] && \
-             [ ! -f "$PROJECT_DIR/app/build.gradle.kts" ]; then
-            echo "ERRO: Módulo app não encontrado."
-            find "$PROJECT_DIR" -maxdepth 3 -name "build.gradle*"
-            exit 1
-          fi
-
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Projeto encontrado: $PROJECT_DIR"
+          echo "Projeto: $PROJECT_DIR"
 
-      - name: Corrigir compatibilidade Java e Kotlin
+      - name: Fix Java and Kotlin JVM targets
         run: |
-          cat > "$RUNNER_TEMP/jvm-fix.gradle" <<'EOF'
-          allprojects {
-              tasks.withType(org.gradle.api.tasks.compile.JavaCompile).configureEach {
-                  sourceCompatibility = "17"
-                  targetCompatibility = "17"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          project = Path(os.environ["PROJECT_DIR"])
+          app = project / "app"
+
+          files = [
+              app / "build.gradle.kts",
+              app / "build.gradle"
+          ]
+
+          gradle_file = next((p for p in files if p.exists()), None)
+
+          if gradle_file is None:
+              raise SystemExit("ERRO: app/build.gradle não encontrado.")
+
+          content = gradle_file.read_text()
+
+          # Altera a configuração Java 1.8 para Java 17.
+          content = content.replace("VERSION_1_8", "VERSION_17")
+          content = content.replace('sourceCompatibility = "1.8"', 'sourceCompatibility = "17"')
+          content = content.replace('targetCompatibility = "1.8"', 'targetCompatibility = "17"')
+
+          # Garante que exista uma configuração compileOptions.
+          if "compileOptions" not in content:
+              if gradle_file.suffix == ".kts":
+                  block = """
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
               }
-
-              tasks.configureEach { task ->
-                  if (task.class.name.contains("KotlinCompile")) {
-                      task.kotlinOptions.jvmTarget = "17"
-                  }
+          """
+              else:
+                  block = """
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
               }
-          }
-          EOF
+          """
 
-          echo "Configuração de compatibilidade criada."
+              content = content.replace("android {", "android {\n" + block, 1)
 
-      - name: Configurar Gradle
+          gradle_file.write_text(content)
+
+          print("Arquivo ajustado:", gradle_file)
+          print("Configuração compileOptions:")
+          for line in content.splitlines():
+              if "compileOptions" in line or "sourceCompatibility" in line or "targetCompatibility" in line or "jvmTarget" in line:
+                  print(line.strip())
+          PY
+
+      - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
 
-      - name: Gerar APK
+      - name: Build APK
         run: |
           gradle --no-daemon \
-            --init-script "$RUNNER_TEMP/jvm-fix.gradle" \
             -p "$PROJECT_DIR" \
             assembleDebug
 
-      - name: Verificar APK
+      - name: Verify APK
         run: |
           APK="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
 
@@ -116,10 +141,10 @@ jobs:
             exit 1
           fi
 
-          echo "APK gerado com sucesso!"
+          echo "APK gerado:"
           ls -lh "$APK"
 
-      - name: Disponibilizar APK
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: FloatingTimer-APK
